@@ -1,5 +1,5 @@
 MIDlet-1: SlackClient, SlackClient.png, SlackClientMidlet
-MIDlet-Jar-Size: 100
+MIDlet-Jar-Size: 13492
 MIDlet-Jar-URL: SlackClient.jar
 MIDlet-Name: SlackClient
 MIDlet-Vendor: Unknown
