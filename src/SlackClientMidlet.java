@@ -16,8 +16,15 @@ public class SlackClientMidlet
   private DataInputStream mSocketIn;
   private Thread mSocketThread;
   private boolean mSocketRunning;
-  private String mSendMessageUrl = "http://localhost:3000/messages/send/"; // Replace with your actual send message endpoint
   private Command mSendCommand;
+  private Command mBackCommand;
+  
+  // Thread-related variables
+  private boolean mInThreadView = false;
+  private String mCurrentThreadTs = null;
+  private String mThreadParentMessage = null;
+  private String mThreadParentAuthor = null;
+  private String mThreadParentTime = null;
   
   // Channel configuration - pairs of display names and channel IDs
   private String[][] mChannels = {
@@ -41,8 +48,13 @@ public class SlackClientMidlet
       public void itemStateChanged(Item item) {
         if (item == mChoiceGroup) {
           // When channel is changed, refresh messages and reconnect socket
-          loadMessages();
-          connectSocket();
+          if (mInThreadView) {
+            // If in thread view, go back to channel view first
+            returnToChannelView();
+          } else {
+            loadMessages();
+            connectSocket();
+          }
         }
       }
     });
@@ -56,8 +68,9 @@ public class SlackClientMidlet
     
     // Add commands
     mSendCommand = new Command("Send", Command.OK, 1);
-        mMainForm.addCommand(mSendCommand);
-        mMainForm.addCommand(new Command("Exit", Command.EXIT, 0));
+    mBackCommand = new Command("Back", Command.BACK, 1);
+    mMainForm.addCommand(mSendCommand);
+    mMainForm.addCommand(new Command("Exit", Command.EXIT, 0));
     mMainForm.setCommandListener(this);
   }
   
@@ -80,7 +93,15 @@ public class SlackClientMidlet
       notifyDestroyed();
     } else if (c == mSendCommand) {
       sendMessage();
-        }
+    } else if (c == mBackCommand) {
+      returnToChannelView();
+    } else if (c.getLabel().equals("View Thread")) {
+      // We need to determine which message was selected
+      // This is handled by the ItemCommandListener on each message item
+      // So this code path shouldn't be reached in normal operation
+      // For safety, default to returning to channel view
+      returnToChannelView();
+    }
   }
   
   /**
@@ -130,11 +151,38 @@ public class SlackClientMidlet
             // Display the messages
             for (int i = 0; i < messages.size(); i++) {
               String[] message = (String[]) messages.elementAt(i);
-              String author = message[0];
-              String time = message[1];
-              String text = message[2];
+              String threadTs = message[0];
+              String author = message[1];
+              String time = message[2];
+              String text = message[3];
               
-              mMainForm.append(new StringItem(author + " (" + time + ")", text));
+              StringItem messageItem = new StringItem(author + " (" + time + ")", text);
+              
+              // Make the message interactive
+              final String fThreadTs = threadTs;
+              final String fText = text;
+              final String fAuthor = author;
+              final String fTime = time;
+              // Add a "View Thread" command
+              Command threadCommand = new Command("View Thread", Command.ITEM, 1);
+              // We can't store data in the Command object, we'll use a closure via ItemCommandListener instead
+              messageItem.addCommand(threadCommand);
+              // Remove invalid call to setScreen - we'll use the ItemCommandListener to handle this
+              messageItem.addCommand(threadCommand);
+              messageItem.setDefaultCommand(threadCommand);
+              messageItem.setItemCommandListener(new ItemCommandListener() {
+                public void commandAction(Command c, Item item) {
+                  if (c.getLabel().equals("View Thread")) {
+                    mThreadParentMessage = fText;
+                    mThreadParentAuthor = fAuthor;
+                    mThreadParentTime = fTime;
+                    openThreadView(fThreadTs);
+                  }
+                }
+              });
+              
+
+              mMainForm.append(messageItem);
             }
           } else {
             // Error handling
@@ -143,6 +191,147 @@ public class SlackClientMidlet
           }
         } catch (Exception e) {
           mMainForm.delete(2);
+          mMainForm.append(new StringItem(null, "Error: " + e.toString()));
+        } finally {
+          try {
+            if (is != null) is.close();
+            if (conn != null) conn.close();
+          } catch (IOException e) {
+            // Ignore
+          }
+        }
+      }
+    };
+    t.start();
+  }
+  
+  /**
+   * Opens the thread view for a specific message
+   */
+  private void openThreadView(final String threadTs) {
+    mInThreadView = true;
+    mCurrentThreadTs = threadTs;
+    
+    // Update UI state for thread view
+    // Don't remove the send command, we need it for replies
+    mMainForm.addCommand(mBackCommand);
+    mTextField.setLabel("Reply to thread:");
+    
+    // Fetch thread messages
+    loadThreadMessages(threadTs);
+  }
+  
+  /**
+   * Return to the main channel view
+   */
+  private void returnToChannelView() {
+    mInThreadView = false;
+    mCurrentThreadTs = null;
+    
+    // Update UI state for channel view
+    mMainForm.removeCommand(mBackCommand);
+    // No need to add send command since it should already be there
+    mTextField.setLabel("Message:");
+    
+    // Return to channel view
+    loadMessages();
+    connectSocket();
+  }
+  
+  /**
+   * Loads thread messages for a specific thread
+   */
+  private void loadThreadMessages(final String threadTs) {
+    Thread t = new Thread() {
+      public void run() {
+        HttpConnection conn = null;
+        InputStream is = null;
+        
+        try {
+          // Clear everything after the TextField
+          while (mMainForm.size() > 2) {
+            mMainForm.delete(2);
+          }
+          
+          // Add loading indicator
+          mMainForm.append(new StringItem(null, "Loading thread..."));
+          
+          // Get the current selected channel ID
+          String channelId = getSelectedChannelId();
+          
+          // Add parent message at the top of the thread view
+          final StringItem parentItem = new StringItem(
+              mThreadParentAuthor + " (" + mThreadParentTime + ")",
+              mThreadParentMessage);
+          
+          // Make parent message clickable to go back
+          Command backCommand = new Command("Back to Channel", Command.ITEM, 1);
+          parentItem.addCommand(backCommand);
+          parentItem.setDefaultCommand(backCommand);
+          parentItem.setItemCommandListener(new ItemCommandListener() {
+            public void commandAction(Command c, Item item) {
+              returnToChannelView();
+            }
+          });
+          
+          // Connect to the API and fetch thread messages
+          String threadUrl = mApiUrl + channelId + "/thread/" + threadTs;
+          conn = (HttpConnection) Connector.open(threadUrl);
+          conn.setRequestMethod("GET");
+          
+          if (conn.getResponseCode() == HttpConnection.HTTP_OK) {
+            is = conn.openInputStream();
+            
+            // Read and process the CSV data
+            InputStreamReader isr = new InputStreamReader(is);
+            StringBuffer sb = new StringBuffer();
+            int ch;
+            while ((ch = isr.read()) != -1) {
+              sb.append((char) ch);
+            }
+            
+            // Process the CSV data
+            String csvData = sb.toString();
+            Vector messages = parseCSV(csvData);
+            
+            // Remove loading indicator
+            mMainForm.delete(2);
+            
+            // Add parent message first
+            mMainForm.append(parentItem);
+            
+            // Display thread separator
+            mMainForm.append(new StringItem(null, "--- Thread Replies ---"));
+            
+            // Display the thread messages
+            if (messages.size() == 0) {
+              mMainForm.append(new StringItem(null, "No replies yet."));
+            } else {
+              for (int i = 0; i < messages.size(); i++) {
+                String[] message = (String[]) messages.elementAt(i);
+                String msgThreadTs = message[0];
+                String author = message[1];
+                String time = message[2];
+                String text = message[3];
+                
+                // Use indentation to show thread replies
+                StringItem threadItem = new StringItem("    "  + author + " (" + time + ")", text);
+                mMainForm.append(threadItem);
+              }
+            }
+          } else {
+            // Error handling
+            mMainForm.delete(2);
+            mMainForm.append(parentItem);
+            mMainForm.append(new StringItem(null, "Error loading thread: " + conn.getResponseCode()));
+          }
+        } catch (Exception e) {
+          mMainForm.delete(2);
+          // Still show parent message even if there's an error
+          final StringItem parentItem = new StringItem(
+              mThreadParentAuthor + " (" + mThreadParentTime + ")",
+              mThreadParentMessage);
+          mMainForm.append(parentItem);
           mMainForm.append(new StringItem(null, "Error: " + e.toString()));
         } finally {
           try {
@@ -179,16 +368,6 @@ public class SlackClientMidlet
           out.writeUTF("SUBSCRIBE " + channelId);
           out.flush();
           
-          // Add connection indicator to the form
-          // Display.getDisplay(SlackClientMidlet.this).callSerially(new Runnable() {
-          //   public void run() {
-          //     mMainForm.append(new StringItem(null, "Connected to socket server for channel " + channelId));
-          //   }
-          // });
-          
-          // Debug message
-          // addDebugMessage("Socket connected and listening");
-          
           // Listen for incoming messages 
           StringBuffer buffer = new StringBuffer();
           int ch;
@@ -199,9 +378,6 @@ public class SlackClientMidlet
               buffer = new StringBuffer();
               
               if (line.length() > 0) {
-                // Add debug to see raw incoming data
-                // addDebugMessage("SOCKET DATA: " + line);
-                
                 // Process the message on the UI thread
                 Display.getDisplay(SlackClientMidlet.this).callSerially(new Runnable() {
                   public void run() {
@@ -262,36 +438,56 @@ public class SlackClientMidlet
   
   /**
    * Adds a new message to the form
-   * Expected format: author|time|message
+   * Expected format: threadTs|author|time|message
    */
   private void addNewMessage(String messageData) {
     try {
       // First try the standard format
       String[] parts = split(messageData, '|');
-      if (parts.length >= 3) {
-        String author = parts[0];
-        String time = parts[1];
-        String text = parts[2];
+      if (parts.length >= 4) {
+        String threadTs = parts[0];
+        String author = parts[1];
+        String time = parts[2];
+        String text = parts[3];
         
-        // Add the message to the top of the message list (after the text field)
-        mMainForm.insert(2, new StringItem(author + " (" + time + ")", text));
+        // Check if this is a thread message
+        if (!threadTs.equals("0") && mInThreadView && 
+            threadTs.equals(mCurrentThreadTs)) {
+          // This is a message for the current thread - add it with indentation
+          mMainForm.insert(2, new StringItem("    " + author + " (" + time + ")", text));
+        } else if (!mInThreadView) {
+          // Only add to main view if not in thread view
+          StringItem messageItem = new StringItem(author + " (" + time + ")", text);
+          
+          // Make the message interactive
+          final String fThreadTs = threadTs;
+          final String fText = text;
+          final String fAuthor = author;
+          final String fTime = time;
+          Command threadCommand = new Command("View Thread", Command.ITEM, 1);
+          // Using the ItemCommandListener to capture thread timestamp instead
+          messageItem.addCommand(threadCommand);
+          // Remove invalid call to setScreen - we'll use the ItemCommandListener instead
+          messageItem.addCommand(threadCommand);
+          messageItem.setDefaultCommand(threadCommand);
+          messageItem.setItemCommandListener(new ItemCommandListener() {
+            public void commandAction(Command c, Item item) {
+              if (c.getLabel().equals("View Thread")) {
+                mThreadParentMessage = fText;
+                mThreadParentAuthor = fAuthor;
+                mThreadParentTime = fTime;
+                openThreadView(fThreadTs);
+              }
+            }
+          });
+          
+          
+          
+          mMainForm.insert(2, messageItem);
+        }
         return;
       } 
-      
-      // If standard format fails, try alternative formats or handle as raw text
-      // It could be JSON, check for basic JSON formatting
-      if (messageData.startsWith("{") && messageData.endsWith("}")) {
-        // Simple JSON parsing (very basic)
-        String author = extractJsonValue(messageData, "author");
-        String time = extractJsonValue(messageData, "time");
-        String text = extractJsonValue(messageData, "text");
-        
-        if (author != null && time != null && text != null) {
-          mMainForm.insert(2, new StringItem(author + " (" + time + ")", text));
-          return;
-        }
-      }
-      
+          
       // If all parsing fails, just display the raw message
       mMainForm.insert(2, new StringItem("New message", messageData));
       
@@ -301,25 +497,7 @@ public class SlackClientMidlet
       mMainForm.insert(2, new StringItem("Raw message", messageData));
     }
   }
-  
-  /**
-   * Very simple JSON value extractor
-   */
-  private String extractJsonValue(String json, String key) {
-    int keyIndex = json.indexOf("\"" + key + "\"");
-    if (keyIndex == -1) return null;
-    
-    int colonIndex = json.indexOf(":", keyIndex);
-    if (colonIndex == -1) return null;
-    
-    int valueStart = json.indexOf("\"", colonIndex) + 1;
-    if (valueStart == 0) return null;
-    
-    int valueEnd = json.indexOf("\"", valueStart);
-    if (valueEnd == -1) return null;
-    
-    return json.substring(valueStart, valueEnd);
-  }
+
   
   /**
    * Add a debug message to the UI
@@ -335,7 +513,7 @@ public class SlackClientMidlet
   }
   
   /**
-   * Parses CSV data in the format author|time|message
+   * Parses CSV data in the format threadTs|author|time|message
    */
   private Vector parseCSV(String csvData) {
     Vector result = new Vector();
@@ -348,7 +526,7 @@ public class SlackClientMidlet
       if (line.length() > 0) {
         // Split each line by the delimiter
         String[] parts = split(line, '|');
-        if (parts.length >= 3) {
+        if (parts.length >= 4) {  // Now expecting at least 4 parts
           result.addElement(parts);
         }
       }
@@ -405,8 +583,13 @@ public class SlackClientMidlet
         
         try {
           // Create a URL with query parameters
-          String url = mSendMessageUrl + channelId + 
+          String url = mApiUrl + "send/" + channelId + 
                        "?message=" + urlEncode(message);
+          
+          // If we're in a thread, add the thread_ts parameter
+          if (mInThreadView && mCurrentThreadTs != null) {
+            url += "&thread_ts=" + urlEncode(mCurrentThreadTs);
+          }
           
           conn = (HttpConnection) Connector.open(url);
           conn.setRequestMethod("GET");
@@ -444,6 +627,13 @@ public class SlackClientMidlet
                     }
                   }
                 }.start();
+                
+                // Refresh the current view (channel or thread)
+                if (mInThreadView && mCurrentThreadTs != null) {
+                  loadThreadMessages(mCurrentThreadTs);
+                } else {
+                  loadMessages();
+                }
               }
             });
           } else {
